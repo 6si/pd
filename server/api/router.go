@@ -189,6 +189,10 @@ func createRouter(prefix string, svr *server.Server) *mux.Router {
 	registerFunc(ruleRouter, "/config/rule", rulesHandler.SetRule, setMethods(http.MethodPost), setAuditBackend(localLog, prometheus))
 	registerFunc(ruleRouter, "/config/rule/{group}/{id}", rulesHandler.DeleteRuleByGroup, setMethods(http.MethodDelete), setAuditBackend(localLog, prometheus))
 
+	shardHandler := newShardHandler(svr, rd)
+	registerFunc(apiRouter, "/shard/mapping", shardHandler.Register, setMethods(http.MethodPost), setAuditBackend(localLog, prometheus))
+	registerFunc(apiRouter, "/shard/mapping/{table_id}", shardHandler.GetMapping, setMethods(http.MethodGet), setAuditBackend(prometheus))
+
 	registerFunc(ruleRouter, "/config/rule_group/{id}", rulesHandler.GetGroupConfig, setMethods(http.MethodGet), setAuditBackend(prometheus))
 	registerFunc(ruleRouter, "/config/rule_group", rulesHandler.SetGroupConfig, setMethods(http.MethodPost), setAuditBackend(localLog, prometheus))
 	registerFunc(ruleRouter, "/config/rule_group/{id}", rulesHandler.DeleteGroupConfig, setMethods(http.MethodDelete), setAuditBackend(localLog, prometheus))
