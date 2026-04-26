@@ -966,26 +966,6 @@ func (f *isolationFilter) Target(_ config.SharedConfigProvider, store *core.Stor
 	return statusOK
 }
 
-type shardFilter struct {
-	scope string
-}
-
-func (f *shardFilter) Scope() string {
-	return f.scope
-}
-
-func (f *shardFilter) Type() filterType {
-	return labelConstraint
-}
-
-func (f *shardFilter) Source(_ *config.PersistOptions, _ *core.StoreInfo) *plan.Status {
-	return statusOK
-}
-
-func (f *shardFilter) Target(_ *config.PersistOptions, store *core.StoreInfo) *plan.Status {
-	return statusOK
-}
-
 // createRegionForRuleFit is used to create a clone region with RegionCreateOptions which is only used for
 // FitRegion in filter
 func createRegionForRuleFit(startKey, endKey []byte,
