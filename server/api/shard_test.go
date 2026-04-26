@@ -24,17 +24,18 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
 	"github.com/stretchr/testify/suite"
-	"github.com/tikv/pd/pkg/apiutil"
-	tu "github.com/tikv/pd/pkg/testutil"
+	"github.com/tikv/pd/pkg/schedule/placement"
+	"github.com/tikv/pd/pkg/utils/apiutil"
+	"github.com/tikv/pd/pkg/utils/keypath"
+	tu "github.com/tikv/pd/pkg/utils/testutil"
+	"github.com/tikv/pd/pkg/versioninfo"
 	"github.com/tikv/pd/server"
-	"github.com/tikv/pd/server/schedule/placement"
-	"github.com/tikv/pd/server/versioninfo"
 )
 
 type shardTestSuite struct {
 	suite.Suite
 	svr       *server.Server
-	cleanup   cleanUpFunc
+	cleanup   tu.CleanupFunc
 	urlPrefix string
 }
 
@@ -70,7 +71,7 @@ func (suite *shardTestSuite) TearDownSuite() {
 func (suite *shardTestSuite) putStore(re interface{ NoError(error, ...interface{}) }, storeID uint64, labels []*metapb.StoreLabel) {
 	s := &server.GrpcServer{Server: suite.svr}
 	_, err := s.PutStore(context.Background(), &pdpb.PutStoreRequest{
-		Header: &pdpb.RequestHeader{ClusterId: suite.svr.ClusterID()},
+		Header: &pdpb.RequestHeader{ClusterId: keypath.ClusterID()},
 		Store: &metapb.Store{
 			Id:        storeID,
 			Address:   fmt.Sprintf("tikv%d", storeID),
@@ -524,18 +525,20 @@ func (suite *shardTestSuite) TestDeleteMapping() {
 	data, _ := json.Marshal(body)
 	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
 
-	statusCode, err := apiutil.DoDelete(testDialClient, suite.shardURL(tableID))
+	resp, err := apiutil.DoDelete(testDialClient, suite.shardURL(tableID))
 	suite.NoError(err)
-	suite.Equal(http.StatusOK, statusCode)
+	resp.Body.Close()
+	suite.Equal(http.StatusOK, resp.StatusCode)
 
 	suite.NoError(tu.CheckGetJSON(testDialClient, suite.shardURL(tableID), nil,
 		tu.Status(re, http.StatusNotFound)))
 }
 
 func (suite *shardTestSuite) TestDeleteNonExistent() {
-	statusCode, err := apiutil.DoDelete(testDialClient, suite.shardURL(99999))
+	resp, err := apiutil.DoDelete(testDialClient, suite.shardURL(99999))
 	suite.NoError(err)
-	suite.Equal(http.StatusNotFound, statusCode)
+	resp.Body.Close()
+	suite.Equal(http.StatusNotFound, resp.StatusCode)
 }
 
 func (suite *shardTestSuite) TestGetNonExistent() {

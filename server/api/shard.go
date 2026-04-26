@@ -24,11 +24,11 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/tikv/pd/pkg/apiutil"
 	"github.com/tikv/pd/pkg/codec"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/schedule/placement"
+	"github.com/tikv/pd/pkg/utils/apiutil"
 	"github.com/tikv/pd/server"
-	"github.com/tikv/pd/server/schedule/placement"
 	"github.com/unrolled/render"
 )
 
@@ -228,7 +228,7 @@ func ensureShardRuleGroup(rm *placement.RuleManager) error {
 func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 	cluster := getCluster(r)
 	if !cluster.GetOpts().IsPlacementRulesEnabled() {
-		h.rd.JSON(w, http.StatusPreconditionFailed, errPlacementDisabled.Error())
+		h.rd.JSON(w, http.StatusPreconditionFailed, errs.ErrPlacementDisabled.Error())
 		return
 	}
 
@@ -412,7 +412,7 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 func (h *shardHandler) GetMapping(w http.ResponseWriter, r *http.Request) {
 	cluster := getCluster(r)
 	if !cluster.GetOpts().IsPlacementRulesEnabled() {
-		h.rd.JSON(w, http.StatusPreconditionFailed, errPlacementDisabled.Error())
+		h.rd.JSON(w, http.StatusPreconditionFailed, errs.ErrPlacementDisabled.Error())
 		return
 	}
 
@@ -492,7 +492,7 @@ func (h *shardHandler) GetMapping(w http.ResponseWriter, r *http.Request) {
 func (h *shardHandler) DeleteMapping(w http.ResponseWriter, r *http.Request) {
 	cluster := getCluster(r)
 	if !cluster.GetOpts().IsPlacementRulesEnabled() {
-		h.rd.JSON(w, http.StatusPreconditionFailed, errPlacementDisabled.Error())
+		h.rd.JSON(w, http.StatusPreconditionFailed, errs.ErrPlacementDisabled.Error())
 		return
 	}
 
