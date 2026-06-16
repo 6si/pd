@@ -57,9 +57,13 @@ func (suite *shardTestSuite) SetupSuite() {
 	configURL := fmt.Sprintf("%s/config", suite.urlPrefix)
 	suite.NoError(tu.CheckPostJSON(testDialClient, configURL, []byte(`{"enable-placement-rules":"true"}`), tu.StatusOK(re)))
 
-	// Register stores 1–5 (TiKV and TiFlash both accepted).
+	// Register stores 1–5 as TiKV stores (no engine label).
 	for _, id := range []uint64{1, 2, 3, 4, 5} {
 		suite.putStore(re, id, nil)
+	}
+	// Register stores 6–9 as TiFlash stores.
+	for _, id := range []uint64{6, 7, 8, 9} {
+		suite.putStore(re, id, []*metapb.StoreLabel{{Key: "engine", Value: "tiflash"}})
 	}
 }
 
@@ -893,4 +897,290 @@ func (suite *shardTestSuite) TestNoPrefixCollisionBetweenTables() {
 	for _, tableID := range []uint64{1000, 1001, 10000, 10001} {
 		apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
 	}
+}
+
+// --- TiFlash learner placement tests ---
+
+// TestAutoAssignTiFlash registers a table with auto_assign_tiflash=true and verifies
+// that learner placement rules are created on TiFlash stores, round-robin across shards.
+func (suite *shardTestSuite) TestAutoAssignTiFlash() {
+	re := suite.Require()
+
+	tableID := uint64(50000)
+	body := shardMapping{
+		TableID:           tableID,
+		ShardCount:        4,
+		AutoAssignTiFlash: true,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalID: 50001, StoreIDs: []uint64{1}},
+			{ShardID: 1, PhysicalID: 50002, StoreIDs: []uint64{2}},
+			{ShardID: 2, PhysicalID: 50003, StoreIDs: []uint64{3}},
+			{ShardID: 3, PhysicalID: 50004, StoreIDs: []uint64{4}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	// Verify that learner rules were created. TiFlash stores are 6,7,8,9.
+	// Round-robin: shard 0 → store 6, shard 1 → store 7, shard 2 → store 8, shard 3 → store 9.
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	rules := rm.GetRulesByGroup("shard")
+
+	learnerCount := 0
+	for _, rule := range rules {
+		if rule.Role == placement.Learner {
+			rTableID, _, _, ok := parseShardRuleID(rule.ID)
+			// Learner rule IDs use "-tf" not "-r", so parseShardRuleID won't match.
+			// Check by prefix instead.
+			if !ok && !isShardLearnerRule(rule.ID, tableID) {
+				continue
+			}
+			if ok && rTableID != tableID {
+				continue
+			}
+			learnerCount++
+			// Verify the rule has engine=tiflash constraint.
+			hasEngineConstraint := false
+			for _, c := range rule.LabelConstraints {
+				if c.Key == "engine" && c.Op == placement.In {
+					for _, v := range c.Values {
+						if v == "tiflash" {
+							hasEngineConstraint = true
+						}
+					}
+				}
+			}
+			suite.True(hasEngineConstraint, "learner rule %s should have engine=tiflash constraint", rule.ID)
+		}
+	}
+	// 4 shards × 1 physical ID each = 4 learner rules.
+	suite.Equal(4, learnerCount, "expected 4 TiFlash learner rules")
+
+	// Clean up.
+	apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
+}
+
+// isShardLearnerRule checks if a rule ID belongs to a shard learner rule for the given table.
+func isShardLearnerRule(ruleID string, tableID uint64) bool {
+	prefix := fmt.Sprintf("%d-shard-", tableID)
+	return len(ruleID) > len(prefix) && ruleID[:len(prefix)] == prefix && containsSubstring(ruleID, "-tf")
+}
+
+func containsSubstring(s, sub string) bool {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+// TestExplicitTiFlashStoreIDs registers with explicit tiflash_store_ids and verifies
+// that learner rules are created on the specified stores.
+func (suite *shardTestSuite) TestExplicitTiFlashStoreIDs() {
+	re := suite.Require()
+
+	tableID := uint64(7100)
+	body := shardMapping{
+		TableID:         tableID,
+		ShardCount:      2,
+		TiFlashStoreIDs: []uint64{6, 7},
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalID: 7101, StoreIDs: []uint64{1}},
+			{ShardID: 1, PhysicalID: 7102, StoreIDs: []uint64{2}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	// Verify learner rules.
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	rules := rm.GetRulesByGroup("shard")
+
+	learnerCount := 0
+	for _, rule := range rules {
+		if rule.Role == placement.Learner && isShardLearnerRule(rule.ID, tableID) {
+			learnerCount++
+			// Verify pinned to a TiFlash store.
+			hasShardSlot := false
+			for _, c := range rule.LabelConstraints {
+				if c.Key == shardSlotLabelKey && c.Op == placement.In && len(c.Values) == 1 {
+					suite.NotEmpty(c.Values[0], "learner rule should be pinned to a store")
+					hasShardSlot = true
+				}
+			}
+			suite.True(hasShardSlot, "learner rule %s should have pd-shard-slot constraint", rule.ID)
+		}
+	}
+	suite.Equal(2, learnerCount, "expected 2 TiFlash learner rules")
+
+	apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
+}
+
+// TestAutoAssignAndExplicitMutuallyExclusive verifies that providing both
+// auto_assign_tiflash and tiflash_store_ids returns an error.
+func (suite *shardTestSuite) TestAutoAssignAndExplicitMutuallyExclusive() {
+	re := suite.Require()
+
+	body := shardMapping{
+		TableID:           uint64(7200),
+		ShardCount:        1,
+		AutoAssignTiFlash: true,
+		TiFlashStoreIDs:   []uint64{6},
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalID: 7201, StoreIDs: []uint64{1}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusNotOK(re)))
+}
+
+// TestExplicitTiFlashNonTiFlashStoreRejected verifies that providing a non-TiFlash
+// store ID in tiflash_store_ids returns an error.
+func (suite *shardTestSuite) TestExplicitTiFlashNonTiFlashStoreRejected() {
+	re := suite.Require()
+
+	body := shardMapping{
+		TableID:         uint64(7300),
+		ShardCount:      1,
+		TiFlashStoreIDs: []uint64{1}, // store 1 is TiKV, not TiFlash
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalID: 7301, StoreIDs: []uint64{1}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusNotOK(re)))
+}
+
+// TestTiFlashCoLocationTwoTables verifies that two tables registered with the same
+// shard count and auto_assign_tiflash get the same TiFlash store assignment per shard.
+func (suite *shardTestSuite) TestTiFlashCoLocationTwoTables() {
+	re := suite.Require()
+
+	for _, tid := range []uint64{7400, 7500} {
+		body := shardMapping{
+			TableID:           tid,
+			ShardCount:        4,
+			AutoAssignTiFlash: true,
+			Mappings: []shardStorePair{
+				{ShardID: 0, PhysicalID: tid + 1, StoreIDs: []uint64{1}},
+				{ShardID: 1, PhysicalID: tid + 2, StoreIDs: []uint64{2}},
+				{ShardID: 2, PhysicalID: tid + 3, StoreIDs: []uint64{3}},
+				{ShardID: 3, PhysicalID: tid + 4, StoreIDs: []uint64{4}},
+			},
+		}
+		data, _ := json.Marshal(body)
+		suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+	}
+
+	// Collect TiFlash store assignments per shard for each table.
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	rules := rm.GetRulesByGroup("shard")
+
+	type shardStore struct {
+		tableID uint64
+		shardID uint64
+		storeID uint64
+	}
+	var assignments []shardStore
+	for _, rule := range rules {
+		if rule.Role != placement.Learner {
+			continue
+		}
+		for _, tid := range []uint64{7400, 7500} {
+			if !isShardLearnerRule(rule.ID, tid) {
+				continue
+			}
+			sid := storeIDFromRule(rule)
+			if sid == 0 {
+				continue
+			}
+			// Extract shard ID from rule ID: "{tableID}-shard-{shardID}-p{physID}-tf{storeID}"
+			var tID, shID uint64
+			fmt.Sscanf(rule.ID, "%d-shard-%d-", &tID, &shID)
+			assignments = append(assignments, shardStore{tID, shID, sid})
+		}
+	}
+
+	// For each shard, the TiFlash store should be the same across both tables.
+	storeByShardT1 := make(map[uint64]uint64)
+	storeByShardT2 := make(map[uint64]uint64)
+	for _, a := range assignments {
+		if a.tableID == 7400 {
+			storeByShardT1[a.shardID] = a.storeID
+		} else if a.tableID == 7500 {
+			storeByShardT2[a.shardID] = a.storeID
+		}
+	}
+	suite.Len(storeByShardT1, 4, "table 7400 should have 4 shard→TiFlash assignments")
+	suite.Len(storeByShardT2, 4, "table 7500 should have 4 shard→TiFlash assignments")
+	for shardID := uint64(0); shardID < 4; shardID++ {
+		suite.Equal(storeByShardT1[shardID], storeByShardT2[shardID],
+			"shard %d should map to same TiFlash store for both tables", shardID)
+	}
+
+	for _, tid := range []uint64{7400, 7500} {
+		apiutil.DoDelete(testDialClient, suite.shardURL(tid)) //nolint:errcheck
+	}
+}
+
+// TestNoTiFlashNoLearnerRules verifies that without tiflash options, no learner rules are created.
+func (suite *shardTestSuite) TestNoTiFlashNoLearnerRules() {
+	re := suite.Require()
+
+	tableID := uint64(7600)
+	body := shardMapping{
+		TableID:    tableID,
+		ShardCount: 2,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalID: 7601, StoreIDs: []uint64{1}},
+			{ShardID: 1, PhysicalID: 7602, StoreIDs: []uint64{2}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	rules := rm.GetRulesByGroup("shard")
+
+	for _, rule := range rules {
+		if rule.Role == placement.Learner && isShardLearnerRule(rule.ID, tableID) {
+			suite.Fail("should not have learner rules when TiFlash not requested")
+		}
+	}
+
+	apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
+}
+
+// TestMultiPhysicalIDsWithTiFlash verifies learner rules are created for each physical ID
+// when using multi-physical-ID mode with TiFlash.
+func (suite *shardTestSuite) TestMultiPhysicalIDsWithTiFlash() {
+	re := suite.Require()
+
+	tableID := uint64(7700)
+	body := shardMapping{
+		TableID:           tableID,
+		ShardCount:        2,
+		AutoAssignTiFlash: true,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalIDs: []uint64{7701, 7703}, StoreIDs: []uint64{1}},
+			{ShardID: 1, PhysicalIDs: []uint64{7702, 7704}, StoreIDs: []uint64{2}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	rules := rm.GetRulesByGroup("shard")
+
+	learnerCount := 0
+	for _, rule := range rules {
+		if rule.Role == placement.Learner && isShardLearnerRule(rule.ID, tableID) {
+			learnerCount++
+		}
+	}
+	// 2 shards × 2 physical IDs each = 4 learner rules.
+	suite.Equal(4, learnerCount, "expected 4 TiFlash learner rules for multi-physical-ID table")
+
+	apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
 }

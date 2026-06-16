@@ -25,10 +25,12 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/tikv/pd/pkg/codec"
+	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/errs"
 	"github.com/tikv/pd/pkg/schedule/placement"
 	"github.com/tikv/pd/pkg/utils/apiutil"
 	"github.com/tikv/pd/server"
+	"github.com/tikv/pd/server/cluster"
 	"github.com/unrolled/render"
 )
 
@@ -59,6 +61,15 @@ type shardMapping struct {
 	TableID    uint64           `json:"table_id"`
 	ShardCount int              `json:"shard_count"`
 	Mappings   []shardStorePair `json:"mappings"`
+
+	// TiFlash learner placement (optional).
+	// TiFlashStoreIDs explicitly lists TiFlash store IDs to place learner
+	// replicas on. Shard slots are assigned round-robin across these stores.
+	// Mutually exclusive with AutoAssignTiFlash.
+	TiFlashStoreIDs []uint64 `json:"tiflash_store_ids,omitempty"`
+	// AutoAssignTiFlash, when true, discovers all Up TiFlash stores
+	// (engine=tiflash label) and assigns shard learner replicas round-robin.
+	AutoAssignTiFlash bool `json:"auto_assign_tiflash,omitempty"`
 }
 
 // shardStorePair assigns a shard slot to one or more stores.
@@ -138,6 +149,33 @@ func parseShardRuleID(id string) (uint64, uint64, uint64, bool) {
 		return 0, 0, 0, false
 	}
 	return tableID, shardID, physicalID, true
+}
+
+// shardLearnerRuleID returns the canonical rule ID for a TiFlash learner rule.
+// Format: "{tableID}-shard-{shardID}-p{physicalID}-tf{tiflashStoreID}".
+func shardLearnerRuleID(tableID, shardID, physicalID, tiflashStoreID uint64) string {
+	return fmt.Sprintf("%d-shard-%d-p%d-tf%d", tableID, shardID, physicalID, tiflashStoreID)
+}
+
+// discoverTiFlashStores returns the store IDs of all Up TiFlash stores in the
+// cluster, sorted by ID for deterministic round-robin assignment.
+func discoverTiFlashStores(c *cluster.RaftCluster) []uint64 {
+	var ids []uint64
+	for _, store := range c.GetStores() {
+		if store.IsRemoved() || !store.IsUp() {
+			continue
+		}
+		if core.IsStoreContainLabel(store.GetMeta(), core.EngineKey, core.EngineTiFlash) {
+			ids = append(ids, store.GetID())
+		}
+	}
+	// Sort for deterministic assignment.
+	for i := 1; i < len(ids); i++ {
+		for j := i; j > 0 && ids[j] < ids[j-1]; j-- {
+			ids[j], ids[j-1] = ids[j-1], ids[j]
+		}
+	}
+	return ids
 }
 
 // storeIDsFromShardRules reads all store IDs for a shard slot from the set of rules
@@ -353,6 +391,49 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Resolve TiFlash store IDs for learner placement.
+	var tiflashStoreIDs []uint64
+	if mapping.AutoAssignTiFlash && len(mapping.TiFlashStoreIDs) > 0 {
+		h.rd.JSON(w, http.StatusBadRequest,
+			"auto_assign_tiflash and tiflash_store_ids are mutually exclusive")
+		return
+	}
+	if mapping.AutoAssignTiFlash {
+		tiflashStoreIDs = discoverTiFlashStores(cluster)
+		if len(tiflashStoreIDs) == 0 {
+			h.rd.JSON(w, http.StatusBadRequest,
+				"auto_assign_tiflash is set but no Up TiFlash stores found")
+			return
+		}
+	} else if len(mapping.TiFlashStoreIDs) > 0 {
+		// Validate explicit TiFlash store IDs: must exist and have engine=tiflash.
+		seen := make(map[uint64]struct{}, len(mapping.TiFlashStoreIDs))
+		for _, sid := range mapping.TiFlashStoreIDs {
+			if sid == 0 {
+				h.rd.JSON(w, http.StatusBadRequest, "tiflash_store_ids: store_id must be non-zero")
+				return
+			}
+			if _, dup := seen[sid]; dup {
+				h.rd.JSON(w, http.StatusBadRequest,
+					fmt.Sprintf("tiflash_store_ids: duplicate store_id %d", sid))
+				return
+			}
+			seen[sid] = struct{}{}
+			store := cluster.GetStore(sid)
+			if store == nil {
+				h.rd.JSON(w, http.StatusBadRequest,
+					fmt.Sprintf("tiflash store %d does not exist", sid))
+				return
+			}
+			if !core.IsStoreContainLabel(store.GetMeta(), core.EngineKey, core.EngineTiFlash) {
+				h.rd.JSON(w, http.StatusBadRequest,
+					fmt.Sprintf("store %d is not a TiFlash store (missing engine=tiflash label)", sid))
+				return
+			}
+		}
+		tiflashStoreIDs = mapping.TiFlashStoreIDs
+	}
+
 	// Label each target store with pd-shard-slot=<storeID>.
 	// Idempotent: the label value equals the store's own ID.
 	for storeID := range seenStores {
@@ -362,6 +443,17 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 		if err := cluster.UpdateStoreLabels(storeID, labels, false); err != nil {
 			h.rd.JSON(w, http.StatusInternalServerError,
 				fmt.Sprintf("failed to label store %d: %s", storeID, err.Error()))
+			return
+		}
+	}
+	// Label TiFlash stores too, so learner rules can pin to them.
+	for _, storeID := range tiflashStoreIDs {
+		labels := []*metapb.StoreLabel{
+			{Key: shardSlotLabelKey, Value: strconv.FormatUint(storeID, 10)},
+		}
+		if err := cluster.UpdateStoreLabels(storeID, labels, false); err != nil {
+			h.rd.JSON(w, http.StatusInternalServerError,
+				fmt.Sprintf("failed to label TiFlash store %d: %s", storeID, err.Error()))
 			return
 		}
 	}
@@ -393,12 +485,9 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 		shardID := pair.ShardID
 		shardCount := mapping.ShardCount
 		for _, physID := range pids {
-			// Each physical ID has its own non-overlapping key range.
-			// This allows PD to assign exactly one Leader rule per physical ID without
-			// checkApplyRules "multiple leader replicas" violations.
 			startKeyHex, endKeyHex := tableKeyRange(physID)
+			// Leader + Voter rules for TiKV stores.
 			for replicaIdx, storeID := range pair.StoreIDs {
-				// replicaIdx 0 is the preferred Leader; all others are Voters.
 				role := placement.Voter
 				if replicaIdx == 0 {
 					role = placement.Leader
@@ -412,9 +501,33 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 						EndKeyHex:   endKeyHex,
 						Role:        role,
 						Count:       1,
-						// Pin to the specific store for co-location.
 						LabelConstraints: []placement.LabelConstraint{
 							{Key: shardSlotLabelKey, Op: placement.In, Values: []string{strconv.FormatUint(storeID, 10)}},
+						},
+						ShardID:    &shardID,
+						ShardCount: &shardCount,
+					},
+					Action: placement.RuleOpAdd,
+				})
+			}
+			// Learner rules for TiFlash stores (one per TiFlash store assigned
+			// to this shard). Shard slots are assigned round-robin across TiFlash
+			// stores so that co-sharded tables share the same TiFlash node per slot.
+			if len(tiflashStoreIDs) > 0 {
+				tfStoreID := tiflashStoreIDs[int(pair.ShardID)%len(tiflashStoreIDs)]
+				learnerIdx := replicaCount // offset past leader+voter indices
+				ops = append(ops, placement.RuleOp{
+					Rule: &placement.Rule{
+						GroupID:     "shard",
+						ID:          shardLearnerRuleID(mapping.TableID, pair.ShardID, physID, tfStoreID),
+						Index:       int(pair.ShardID)*replicaCount + learnerIdx,
+						StartKeyHex: startKeyHex,
+						EndKeyHex:   endKeyHex,
+						Role:        placement.Learner,
+						Count:       1,
+						LabelConstraints: []placement.LabelConstraint{
+							{Key: shardSlotLabelKey, Op: placement.In, Values: []string{strconv.FormatUint(tfStoreID, 10)}},
+							{Key: core.EngineKey, Op: placement.In, Values: []string{core.EngineTiFlash}},
 						},
 						ShardID:    &shardID,
 						ShardCount: &shardCount,
