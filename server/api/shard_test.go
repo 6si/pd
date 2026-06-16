@@ -661,6 +661,212 @@ func (suite *shardTestSuite) TestGetInvalidTableID() {
 		tu.Status(re, http.StatusBadRequest)))
 }
 
+// --- Multi-physical-ID tests (SHARD BY + PARTITION BY) ---
+
+func (suite *shardTestSuite) TestRegisterMultiPhysicalIDs() {
+	re := suite.Require()
+	tableID := uint64(1100)
+
+	// Simulate a SHARD BY + PARTITION BY table: 2 shards × 3 partitions = 6 physical IDs.
+	body := shardMapping{
+		TableID:    tableID,
+		ShardCount: 2,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalIDs: []uint64{1101, 1102, 1103}, StoreIDs: []uint64{1, 2}},
+			{ShardID: 1, PhysicalIDs: []uint64{1104, 1105, 1106}, StoreIDs: []uint64{2, 3}},
+		},
+	}
+	data, err := json.Marshal(body)
+	suite.NoError(err)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	// Verify rules: each physical ID should have its own key range.
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	physIDsWithRules := make(map[uint64]struct{})
+	for _, rule := range rm.GetRulesByGroup("shard") {
+		rTableID, _, rPhysID, ok := parseShardRuleID(rule.ID)
+		if !ok || rTableID != tableID {
+			continue
+		}
+		physIDsWithRules[rPhysID] = struct{}{}
+		expectedStart, expectedEnd := tableKeyRange(rPhysID)
+		suite.Equal(expectedStart, rule.StartKeyHex)
+		suite.Equal(expectedEnd, rule.EndKeyHex)
+	}
+	// All 6 physical IDs should have rules.
+	suite.Len(physIDsWithRules, 6)
+
+	// GET should return the multi-physical-ID mapping.
+	var result shardMapping
+	suite.NoError(tu.ReadGetJSON(re, testDialClient, suite.shardURL(tableID), &result))
+	suite.Equal(tableID, result.TableID)
+	suite.Equal(2, result.ShardCount)
+	suite.Len(result.Mappings, 2)
+
+	byShardID := make(map[uint64]shardStorePair, len(result.Mappings))
+	for _, p := range result.Mappings {
+		byShardID[p.ShardID] = p
+	}
+	suite.Equal([]uint64{1101, 1102, 1103}, byShardID[0].PhysicalIDs)
+	suite.Equal([]uint64{1, 2}, byShardID[0].StoreIDs)
+	suite.Equal([]uint64{1104, 1105, 1106}, byShardID[1].PhysicalIDs)
+	suite.Equal([]uint64{2, 3}, byShardID[1].StoreIDs)
+
+	// Clean up.
+	resp, err := apiutil.DoDelete(testDialClient, suite.shardURL(tableID))
+	suite.NoError(err)
+	resp.Body.Close()
+	suite.Equal(http.StatusOK, resp.StatusCode)
+}
+
+func (suite *shardTestSuite) TestRegisterMultiPhysicalIDsCoLocation() {
+	re := suite.Require()
+
+	// Two tables with same shard→store mapping but different physical IDs.
+	for i, tableID := range []uint64{1200, 1201} {
+		physBase := uint64(12000 + i*100)
+		body := shardMapping{
+			TableID:    tableID,
+			ShardCount: 2,
+			Mappings: []shardStorePair{
+				{ShardID: 0, PhysicalIDs: []uint64{physBase, physBase + 1}, StoreIDs: []uint64{1, 2}},
+				{ShardID: 1, PhysicalIDs: []uint64{physBase + 2, physBase + 3}, StoreIDs: []uint64{2, 3}},
+			},
+		}
+		data, _ := json.Marshal(body)
+		suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+	}
+
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	storesForShard := func(tableID, shardID uint64) []uint64 {
+		return storeIDsFromShardRules(rm.GetRulesByGroup("shard"), tableID, shardID)
+	}
+
+	// Same shard→store mapping across both tables.
+	suite.Equal(storesForShard(1200, 0), storesForShard(1201, 0))
+	suite.Equal(storesForShard(1200, 1), storesForShard(1201, 1))
+
+	// Clean up.
+	for _, tableID := range []uint64{1200, 1201} {
+		apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
+	}
+}
+
+func (suite *shardTestSuite) TestBackwardCompatSinglePhysicalID() {
+	re := suite.Require()
+	tableID := uint64(1300)
+
+	// Legacy payload: only physical_id (singular), no physical_ids.
+	body := shardMapping{
+		TableID:    tableID,
+		ShardCount: 2,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalID: 1301, StoreIDs: []uint64{1, 2}},
+			{ShardID: 1, PhysicalID: 1302, StoreIDs: []uint64{2, 3}},
+		},
+	}
+	data, err := json.Marshal(body)
+	suite.NoError(err)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	var result shardMapping
+	suite.NoError(tu.ReadGetJSON(re, testDialClient, suite.shardURL(tableID), &result))
+	suite.Equal(2, result.ShardCount)
+
+	byShardID := make(map[uint64]shardStorePair, len(result.Mappings))
+	for _, p := range result.Mappings {
+		byShardID[p.ShardID] = p
+	}
+	// Single physical ID: physical_id populated, physical_ids omitted.
+	suite.Equal(uint64(1301), byShardID[0].PhysicalID)
+	suite.Empty(byShardID[0].PhysicalIDs)
+	suite.Equal(uint64(1302), byShardID[1].PhysicalID)
+	suite.Empty(byShardID[1].PhysicalIDs)
+
+	// Clean up.
+	resp, err := apiutil.DoDelete(testDialClient, suite.shardURL(tableID))
+	suite.NoError(err)
+	resp.Body.Close()
+}
+
+func (suite *shardTestSuite) TestMultiPhysicalIDsDuplicateRejected() {
+	re := suite.Require()
+	body := shardMapping{
+		TableID:    1,
+		ShardCount: 2,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalIDs: []uint64{1401, 1402}, StoreIDs: []uint64{1, 2}},
+			{ShardID: 1, PhysicalIDs: []uint64{1402, 1403}, StoreIDs: []uint64{2, 3}}, // 1402 duplicate
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data,
+		tu.Status(re, http.StatusBadRequest)))
+}
+
+func (suite *shardTestSuite) TestMultiPhysicalIDsZeroRejected() {
+	re := suite.Require()
+	body := shardMapping{
+		TableID:    1,
+		ShardCount: 1,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalIDs: []uint64{1501, 0}, StoreIDs: []uint64{1, 2}},
+		},
+	}
+	data, _ := json.Marshal(body)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data,
+		tu.Status(re, http.StatusBadRequest)))
+}
+
+func (suite *shardTestSuite) TestRegisterReplacesMultiPhysicalIDRules() {
+	re := suite.Require()
+	tableID := uint64(1600)
+
+	// First: register with 3 physical IDs per shard.
+	first := shardMapping{
+		TableID:    tableID,
+		ShardCount: 1,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalIDs: []uint64{1601, 1602, 1603}, StoreIDs: []uint64{1}},
+		},
+	}
+	data, _ := json.Marshal(first)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	rm := suite.svr.GetRaftCluster().GetRuleManager()
+	count := 0
+	for _, rule := range rm.GetRulesByGroup("shard") {
+		rTableID, _, _, ok := parseShardRuleID(rule.ID)
+		if ok && rTableID == tableID {
+			count++
+		}
+	}
+	suite.Equal(3, count, "should have 3 rules (one per physical ID)")
+
+	// Second: re-register with 2 physical IDs — old rules should be gone.
+	second := shardMapping{
+		TableID:    tableID,
+		ShardCount: 1,
+		Mappings: []shardStorePair{
+			{ShardID: 0, PhysicalIDs: []uint64{1611, 1612}, StoreIDs: []uint64{2}},
+		},
+	}
+	data, _ = json.Marshal(second)
+	suite.NoError(tu.CheckPostJSON(testDialClient, suite.shardURL(), data, tu.StatusOK(re)))
+
+	count = 0
+	for _, rule := range rm.GetRulesByGroup("shard") {
+		rTableID, _, _, ok := parseShardRuleID(rule.ID)
+		if ok && rTableID == tableID {
+			count++
+		}
+	}
+	suite.Equal(2, count, "should have 2 rules after re-register (old 3 deleted)")
+
+	// Clean up.
+	apiutil.DoDelete(testDialClient, suite.shardURL(tableID)) //nolint:errcheck
+}
+
 // Ensure table "1000" mappings are not returned when asking for table "10000".
 func (suite *shardTestSuite) TestNoPrefixCollisionBetweenTables() {
 	re := suite.Require()

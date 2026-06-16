@@ -62,14 +62,33 @@ type shardMapping struct {
 }
 
 // shardStorePair assigns a shard slot to one or more stores.
-// PhysicalID is the TiDB physical table ID allocated for this shard at CREATE
-// TABLE time. It defines the shard's key range [t{PhysicalID}, t{PhysicalID+1}),
-// giving each shard a non-overlapping range so PD can pin one Leader per shard.
+// PhysicalIDs lists all TiDB physical table IDs for this shard slot. For a pure
+// SHARD BY table this is a single ID; for a SHARD BY + PARTITION BY table it
+// contains one physical ID per partition (all belonging to the same shard slot).
+// Each physical ID defines a non-overlapping key range [t{PhysicalID}, t{PhysicalID+1}).
 // StoreIDs[0] receives the Leader placement rule; StoreIDs[1:] receive Voter rules.
+//
+// PhysicalID (singular) is kept for backward compatibility. On input, if
+// PhysicalIDs is non-empty it takes precedence; otherwise PhysicalID is used.
+// On output, PhysicalID is set to PhysicalIDs[0] for legacy clients.
 type shardStorePair struct {
-	ShardID    uint64   `json:"shard_id"`
-	PhysicalID uint64   `json:"physical_id"`
-	StoreIDs   []uint64 `json:"store_ids"`
+	ShardID     uint64   `json:"shard_id"`
+	PhysicalID  uint64   `json:"physical_id"`
+	PhysicalIDs []uint64 `json:"physical_ids,omitempty"`
+	StoreIDs    []uint64 `json:"store_ids"`
+}
+
+// physicalIDs returns the effective list of physical IDs for a shard pair.
+// If PhysicalIDs is populated, it is returned directly; otherwise the singular
+// PhysicalID is wrapped in a single-element slice.
+func (p *shardStorePair) physicalIDs() []uint64 {
+	if len(p.PhysicalIDs) > 0 {
+		return p.PhysicalIDs
+	}
+	if p.PhysicalID != 0 {
+		return []uint64{p.PhysicalID}
+	}
+	return nil
 }
 
 func newShardHandler(svr *server.Server, rd *render.Render) *shardHandler {
@@ -124,12 +143,14 @@ func parseShardRuleID(id string) (uint64, uint64, uint64, bool) {
 // storeIDsFromShardRules reads all store IDs for a shard slot from the set of rules
 // for that (tableID, shardID). Returns nil if no rules are found.
 // Index 0 = Leader-rule store; index 1+ = Voter-rule stores.
+// With multi-physical-ID support, multiple rules may exist per (shard, replicaIdx)
+// pair (one per physical ID). This function deduplicates by replicaIdx.
 func storeIDsFromShardRules(rules []*placement.Rule, tableID, shardID uint64) []uint64 {
 	type replicaStore struct {
 		idx     int
 		storeID uint64
 	}
-	var found []replicaStore
+	seen := make(map[int]uint64) // replicaIdx → storeID (dedup across physical IDs)
 	for _, rule := range rules {
 		rTableID, rShardID, _, ok := parseShardRuleID(rule.ID)
 		if !ok || rTableID != tableID || rShardID != shardID {
@@ -147,12 +168,16 @@ func storeIDsFromShardRules(rules []*placement.Rule, tableID, shardID uint64) []
 				replicaIdx = n
 			}
 		}
-		found = append(found, replicaStore{replicaIdx, storeID})
+		seen[replicaIdx] = storeID
 	}
-	if len(found) == 0 {
+	if len(seen) == 0 {
 		return nil
 	}
-	// Sort by replicaIdx so index 0 is the Leader store.
+	// Collect and sort by replicaIdx so index 0 is the Leader store.
+	found := make([]replicaStore, 0, len(seen))
+	for idx, sid := range seen {
+		found = append(found, replicaStore{idx, sid})
+	}
 	for i := 1; i < len(found); i++ {
 		for j := i; j > 0 && found[j].idx < found[j-1].idx; j-- {
 			found[j], found[j-1] = found[j-1], found[j]
@@ -267,12 +292,13 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Validate each entry: shard ID in-range, physical_id non-zero, no duplicates,
+	// Validate each entry: shard ID in-range, physical IDs non-zero and unique,
 	// all stores exist, no duplicate stores per shard.
 	seenShards := make(map[uint64]struct{}, len(mapping.Mappings))
-	seenPhysIDs := make(map[uint64]struct{}, len(mapping.Mappings))
+	seenPhysIDs := make(map[uint64]struct{})
 	seenStores := make(map[uint64]struct{})
-	for _, pair := range mapping.Mappings {
+	for i := range mapping.Mappings {
+		pair := &mapping.Mappings[i]
 		if pair.ShardID >= uint64(mapping.ShardCount) {
 			h.rd.JSON(w, http.StatusBadRequest,
 				fmt.Sprintf("shard_id %d out of range [0, %d)", pair.ShardID, mapping.ShardCount))
@@ -285,17 +311,25 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 		}
 		seenShards[pair.ShardID] = struct{}{}
 
-		if pair.PhysicalID == 0 {
+		pids := pair.physicalIDs()
+		if len(pids) == 0 {
 			h.rd.JSON(w, http.StatusBadRequest,
-				fmt.Sprintf("shard %d: physical_id must be non-zero", pair.ShardID))
+				fmt.Sprintf("shard %d: at least one physical_id is required", pair.ShardID))
 			return
 		}
-		if _, dup := seenPhysIDs[pair.PhysicalID]; dup {
-			h.rd.JSON(w, http.StatusBadRequest,
-				fmt.Sprintf("shard %d: duplicate physical_id %d", pair.ShardID, pair.PhysicalID))
-			return
+		for _, pid := range pids {
+			if pid == 0 {
+				h.rd.JSON(w, http.StatusBadRequest,
+					fmt.Sprintf("shard %d: physical_id must be non-zero", pair.ShardID))
+				return
+			}
+			if _, dup := seenPhysIDs[pid]; dup {
+				h.rd.JSON(w, http.StatusBadRequest,
+					fmt.Sprintf("shard %d: duplicate physical_id %d", pair.ShardID, pid))
+				return
+			}
+			seenPhysIDs[pid] = struct{}{}
 		}
-		seenPhysIDs[pair.PhysicalID] = struct{}{}
 
 		seenInShard := make(map[uint64]struct{}, len(pair.StoreIDs))
 		for _, storeID := range pair.StoreIDs {
@@ -355,36 +389,39 @@ func (h *shardHandler) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, pair := range mapping.Mappings {
-		// Each shard has its own non-overlapping key range via its physical table ID.
-		// This allows PD to assign exactly one Leader rule per shard without
-		// checkApplyRules "multiple leader replicas" violations.
-		startKeyHex, endKeyHex := tableKeyRange(pair.PhysicalID)
+		pids := pair.physicalIDs()
 		shardID := pair.ShardID
 		shardCount := mapping.ShardCount
-		for replicaIdx, storeID := range pair.StoreIDs {
-			// replicaIdx 0 is the preferred Leader; all others are Voters.
-			role := placement.Voter
-			if replicaIdx == 0 {
-				role = placement.Leader
-			}
-			ops = append(ops, placement.RuleOp{
-				Rule: &placement.Rule{
-					GroupID:     "shard",
-					ID:          shardRuleID(mapping.TableID, pair.ShardID, pair.PhysicalID, replicaIdx),
-					Index:       int(pair.ShardID)*replicaCount + replicaIdx,
-					StartKeyHex: startKeyHex,
-					EndKeyHex:   endKeyHex,
-					Role:        role,
-					Count:       1,
-					// Pin to the specific store for co-location.
-					LabelConstraints: []placement.LabelConstraint{
-						{Key: shardSlotLabelKey, Op: placement.In, Values: []string{strconv.FormatUint(storeID, 10)}},
+		for _, physID := range pids {
+			// Each physical ID has its own non-overlapping key range.
+			// This allows PD to assign exactly one Leader rule per physical ID without
+			// checkApplyRules "multiple leader replicas" violations.
+			startKeyHex, endKeyHex := tableKeyRange(physID)
+			for replicaIdx, storeID := range pair.StoreIDs {
+				// replicaIdx 0 is the preferred Leader; all others are Voters.
+				role := placement.Voter
+				if replicaIdx == 0 {
+					role = placement.Leader
+				}
+				ops = append(ops, placement.RuleOp{
+					Rule: &placement.Rule{
+						GroupID:     "shard",
+						ID:          shardRuleID(mapping.TableID, pair.ShardID, physID, replicaIdx),
+						Index:       int(pair.ShardID)*replicaCount + replicaIdx,
+						StartKeyHex: startKeyHex,
+						EndKeyHex:   endKeyHex,
+						Role:        role,
+						Count:       1,
+						// Pin to the specific store for co-location.
+						LabelConstraints: []placement.LabelConstraint{
+							{Key: shardSlotLabelKey, Op: placement.In, Values: []string{strconv.FormatUint(storeID, 10)}},
+						},
+						ShardID:    &shardID,
+						ShardCount: &shardCount,
 					},
-					ShardID:    &shardID,
-					ShardCount: &shardCount,
-				},
-				Action: placement.RuleOpAdd,
-			})
+					Action: placement.RuleOpAdd,
+				})
+			}
 		}
 	}
 
@@ -426,12 +463,12 @@ func (h *shardHandler) GetMapping(w http.ResponseWriter, r *http.Request) {
 	rm := cluster.GetRuleManager()
 	rules := rm.GetRulesByGroup("shard")
 
-	// Collect physicalID and shardCount per shard for this table.
+	// Collect all physicalIDs and shardCount per shard for this table.
 	type shardMeta struct {
-		physicalID uint64
-		shardCount int
+		physicalIDs map[uint64]struct{}
+		shardCount  int
 	}
-	metaByShardID := make(map[uint64]shardMeta)
+	metaByShardID := make(map[uint64]*shardMeta)
 	for _, rule := range rules {
 		rTableID, rShardID, rPhysID, ok := parseShardRuleID(rule.ID)
 		if !ok || rTableID != tableID {
@@ -441,7 +478,10 @@ func (h *shardHandler) GetMapping(w http.ResponseWriter, r *http.Request) {
 		if rule.ShardCount != nil {
 			sc = *rule.ShardCount
 		}
-		metaByShardID[rShardID] = shardMeta{physicalID: rPhysID, shardCount: sc}
+		if _, exists := metaByShardID[rShardID]; !exists {
+			metaByShardID[rShardID] = &shardMeta{physicalIDs: make(map[uint64]struct{}), shardCount: sc}
+		}
+		metaByShardID[rShardID].physicalIDs[rPhysID] = struct{}{}
 	}
 
 	if len(metaByShardID) == 0 {
@@ -459,11 +499,29 @@ func (h *shardHandler) GetMapping(w http.ResponseWriter, r *http.Request) {
 	pairs := make([]shardStorePair, 0, len(metaByShardID))
 	for shardID, meta := range metaByShardID {
 		storeIDs := storeIDsFromShardRules(rules, tableID, shardID)
-		pairs = append(pairs, shardStorePair{
-			ShardID:    shardID,
-			PhysicalID: meta.physicalID,
-			StoreIDs:   storeIDs,
-		})
+		// Collect physical IDs in sorted order for deterministic output.
+		pids := make([]uint64, 0, len(meta.physicalIDs))
+		for pid := range meta.physicalIDs {
+			pids = append(pids, pid)
+		}
+		for i := 1; i < len(pids); i++ {
+			for j := i; j > 0 && pids[j] < pids[j-1]; j-- {
+				pids[j], pids[j-1] = pids[j-1], pids[j]
+			}
+		}
+		pair := shardStorePair{
+			ShardID:  shardID,
+			StoreIDs: storeIDs,
+		}
+		if len(pids) == 1 {
+			// Single physical ID: populate both fields for backward compat.
+			pair.PhysicalID = pids[0]
+		} else {
+			// Multiple physical IDs: set PhysicalID to first, PhysicalIDs to all.
+			pair.PhysicalID = pids[0]
+			pair.PhysicalIDs = pids
+		}
+		pairs = append(pairs, pair)
 	}
 
 	// Sort pairs by ShardID for deterministic output.
