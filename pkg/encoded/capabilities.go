@@ -137,3 +137,88 @@ func ComputeClusterStatus(stores []*StoreEncodingCapabilities, totalTiFlash int)
 
 	return status
 }
+
+// NewFullEncodingCapabilities creates capabilities for a store that supports
+// all 4 phases of encoded operations.
+func NewFullEncodingCapabilities(storeID uint64) *StoreEncodingCapabilities {
+	return &StoreEncodingCapabilities{
+		StoreID: storeID,
+		Capabilities: []Capability{
+			CapDictionaryEncoding,
+			CapEncodedFilter,
+			CapEncodedGroupBy,
+			CapEncodedBloomFilter,
+			CapEncodedStarJoin,
+		},
+		MaxDictCardinality: 4096,
+		EncodingVersion:    3,
+	}
+}
+
+// PhaseCapabilities maps encoding versions to their supported capabilities.
+var PhaseCapabilities = map[uint32][]Capability{
+	1: {CapDictionaryEncoding},
+	2: {CapDictionaryEncoding, CapEncodedFilter, CapEncodedGroupBy},
+	3: {CapDictionaryEncoding, CapEncodedFilter, CapEncodedGroupBy, CapEncodedBloomFilter, CapEncodedStarJoin},
+}
+
+// SupportsPhase checks if a store supports a specific encoding phase.
+func (s *StoreEncodingCapabilities) SupportsPhase(phase uint32) bool {
+	return s.EncodingVersion >= phase
+}
+
+// ClusterSupportsPhase checks if all stores in the cluster support a given phase.
+func (status *ClusterEncodingStatus) ClusterSupportsPhase(phase uint32) bool {
+	return status.AllStoresReady && status.MinEncodingVersion >= phase
+}
+
+// OperationFeasibility describes whether a specific encoded operation can run
+// across the cluster.
+type OperationFeasibility struct {
+	// Operation is the capability being checked
+	Operation Capability `json:"operation"`
+
+	// Feasible indicates all relevant stores support this operation
+	Feasible bool `json:"feasible"`
+
+	// StoresReady is the count of stores that support this operation
+	StoresReady int `json:"stores_ready"`
+
+	// StoresTotal is the total number of TiFlash stores
+	StoresTotal int `json:"stores_total"`
+}
+
+// CheckOperationFeasibility checks if a specific encoded operation can run
+// on all TiFlash stores in the cluster.
+func CheckOperationFeasibility(stores []*StoreEncodingCapabilities, totalTiFlash int, op Capability) *OperationFeasibility {
+	result := &OperationFeasibility{
+		Operation:   op,
+		StoresTotal: totalTiFlash,
+	}
+
+	for _, s := range stores {
+		if s.HasCapability(op) {
+			result.StoresReady++
+		}
+	}
+
+	result.Feasible = result.StoresReady == totalTiFlash && totalTiFlash > 0
+	return result
+}
+
+// AllOperationsFeasibility checks feasibility for all encoded operations.
+func AllOperationsFeasibility(stores []*StoreEncodingCapabilities, totalTiFlash int) []*OperationFeasibility {
+	ops := []Capability{
+		CapDictionaryEncoding,
+		CapEncodedFilter,
+		CapEncodedGroupBy,
+		CapEncodedBloomFilter,
+		CapEncodedStarJoin,
+	}
+
+	results := make([]*OperationFeasibility, 0, len(ops))
+	for _, op := range ops {
+		results = append(results, CheckOperationFeasibility(stores, totalTiFlash, op))
+	}
+	return results
+}
