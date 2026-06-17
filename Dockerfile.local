@@ -1,0 +1,30 @@
+FROM golang:1.21 AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    make \
+    git \
+    gcc \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /go/src/github.com/tikv/pd
+WORKDIR /go/src/github.com/tikv/pd
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN make pd-server pd-ctl pd-recover
+
+FROM debian:bookworm-slim
+
+COPY --from=builder /go/src/github.com/tikv/pd/bin/pd-server /pd-server
+COPY --from=builder /go/src/github.com/tikv/pd/bin/pd-ctl /pd-ctl
+COPY --from=builder /go/src/github.com/tikv/pd/bin/pd-recover /pd-recover
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates bash dnsutils wget && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /bin/bash /bin/sh
+
+EXPOSE 2379 2380
+
+ENTRYPOINT ["/pd-server"]

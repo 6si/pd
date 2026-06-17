@@ -70,6 +70,8 @@ type Rule struct {
 	IsolationLevel   string            `json:"isolation_level,omitempty"`   // used to isolate replicas explicitly and forcibly
 	Version          uint64            `json:"version,omitempty"`           // only set at runtime, add 1 each time rules updated, begin from 0.
 	CreateTimestamp  uint64            `json:"create_timestamp,omitempty"`  // only set at runtime, recorded rule create timestamp
+	ShardID          *uint64           `json:"shard_id,omitempty"`          // shard index (0 to N-1) for shard key placement
+	ShardCount       *int              `json:"shard_count,omitempty"`       // total number of shards
 	group            *RuleGroup        // only set at runtime, no need to {,un}marshal or persist.
 }
 
