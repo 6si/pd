@@ -43,6 +43,7 @@ import (
 	"github.com/tikv/pd/pkg/core"
 	"github.com/tikv/pd/pkg/core/storelimit"
 	"github.com/tikv/pd/pkg/errs"
+	"github.com/tikv/pd/pkg/gc"
 	"github.com/tikv/pd/pkg/gctuner"
 	"github.com/tikv/pd/pkg/id"
 	"github.com/tikv/pd/pkg/keyspace"
@@ -139,8 +140,10 @@ type Server interface {
 	ReplicateFileToMember(ctx context.Context, member *pdpb.Member, name string, data []byte) error
 	GetKeyspaceManager() *keyspace.Manager
 	GetKeyspaceGroupManager() *keyspace.GroupManager
+	GetMetaServiceGroupManager() *keyspace.MetaServiceGroupManager
 	IsKeyspaceGroupEnabled() bool
 	GetMeteringWriter() *metering.Writer
+	GetGCStateManager() *gc.GCStateManager
 }
 
 // RaftCluster is used for cluster config management.
@@ -202,6 +205,8 @@ type RaftCluster struct {
 	logRunner ratelimit.Runner
 	// syncRegionRunner is used to sync region asynchronously.
 	syncRegionRunner ratelimit.Runner
+
+	stopGCStateManager func()
 }
 
 // Status saves some state information.
@@ -470,6 +475,10 @@ func (c *RaftCluster) Start(s Server, bootstrap bool) (err error) {
 	go c.startGCTuner()
 	go c.startProgressGC()
 	go c.runStorageSizeCollector(s.GetMeteringWriter(), c.regionLabeler, s.GetKeyspaceManager())
+
+	s.GetGCStateManager().OnNodeBecomesLeader()
+	c.stopGCStateManager = s.GetGCStateManager().OnNodeBecomesFollower
+
 	log.Info("start background jobs completed", zap.Duration("cost", time.Since(backgroundJobsStart)))
 	runnersStart := time.Now()
 	c.running = true
@@ -601,7 +610,7 @@ func (c *RaftCluster) startTSOJobsIfNeeded() error {
 }
 
 func (c *RaftCluster) stopTSOJobsIfNeeded() {
-	if !c.tsoAllocator.IsInitialize() {
+	if c.tsoAllocator == nil || !c.tsoAllocator.IsInitialize() {
 		return
 	}
 	log.Info("closing the embedded TSO allocator")
@@ -960,6 +969,15 @@ func (c *RaftCluster) runReplicationMode() {
 
 // Stop stops the cluster.
 func (c *RaftCluster) Stop() {
+	var (
+		cancel             context.CancelFunc
+		stopSchedulingJobs bool
+		heartbeatRunner    ratelimit.Runner
+		miscRunner         ratelimit.Runner
+		logRunner          ratelimit.Runner
+		syncRegionRunner   ratelimit.Runner
+	)
+
 	c.Lock()
 	// We need to try to stop tso jobs whatever the cluster is running or not.
 	// Because we need to call checkTSOService as soon as possible while the cluster is starting,
@@ -973,15 +991,35 @@ func (c *RaftCluster) Stop() {
 		return
 	}
 	c.running = false
-	c.cancel()
-	if !c.IsServiceIndependent(constant.SchedulingServiceName) {
+	cancel = c.cancel
+	stopSchedulingJobs = !c.IsServiceIndependent(constant.SchedulingServiceName)
+	heartbeatRunner = c.heartbeatRunner
+	miscRunner = c.miscRunner
+	logRunner = c.logRunner
+	syncRegionRunner = c.syncRegionRunner
+	if c.stopGCStateManager != nil {
+		c.stopGCStateManager()
+	}
+	c.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if stopSchedulingJobs {
 		c.stopSchedulingJobs()
 	}
-	c.heartbeatRunner.Stop()
-	c.miscRunner.Stop()
-	c.logRunner.Stop()
-	c.syncRegionRunner.Stop()
-	c.Unlock()
+	if heartbeatRunner != nil {
+		heartbeatRunner.Stop()
+	}
+	if miscRunner != nil {
+		miscRunner.Stop()
+	}
+	if logRunner != nil {
+		logRunner.Stop()
+	}
+	if syncRegionRunner != nil {
+		syncRegionRunner.Stop()
+	}
 
 	c.wg.Wait()
 	log.Info("raft cluster is stopped")
